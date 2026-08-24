@@ -12,6 +12,17 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      images:
+        description: Images to rebuild (comma-separated, or all)
+        required: false
+        default: all
+        type: string
+      publish:
+        description: Publish the rebuilt image tags
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   changes:
@@ -32,12 +43,34 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
+          DISPATCH_IMAGES: ${{ inputs.images }}
         run: |
           set -euo pipefail
 
           all_images='["ftpsync","nix-channels","rubygems-mirror","rustup-mirror","tsumugu","tunasync-scripts"]'
-          if [ "$EVENT_NAME" = workflow_dispatch ] || [ "$EVENT_NAME" = schedule ]; then
+          if [ "$EVENT_NAME" = schedule ]; then
             images="$all_images"
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
+            requested="$(printf '%s' "${DISPATCH_IMAGES:-all}" | tr -d '[:space:]')"
+            if [ "$requested" = all ]; then
+              images="$all_images"
+            else
+              selected=''
+              IFS=','
+              for image in $requested; do
+                case "$image" in
+                  ftpsync|nix-channels|rubygems-mirror|rustup-mirror|tsumugu|tunasync-scripts)
+                    selected="$selected $image"
+                    ;;
+                  *)
+                    echo "Unknown image: $image" >&2
+                    exit 1
+                    ;;
+                esac
+              done
+              unset IFS
+              images="$(printf '%s\n' $selected | sort -u | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+            fi
           else
             if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
               BASE_SHA="$(git rev-parse "$HEAD_SHA^1")"
@@ -163,7 +196,7 @@ jobs:
       -
         name: Login to DockerHub
         uses: docker/login-action@v4
-        if: github.event_name == 'push' || github.event_name == 'schedule'
+        if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -176,14 +209,14 @@ jobs:
           file: ${{ steps.docker_file_dir.outputs.docker_file_dir }}/Dockerfile
           build-args: |
             CRATE_VERSION=${{ matrix.image == 'rustup-mirror' && needs.crate_versions.outputs.rustup_mirror || matrix.image == 'tsumugu' && needs.crate_versions.outputs.tsumugu || '' }}
-          push: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+          push: ${{ github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
           tags: tunathu/${{ matrix.image }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ runner.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ runner.arch }}
           pull: true
-          outputs: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'type=image,push-by-digest=true,name-canonical=true,push=true' || 'type=image' }}
+          outputs: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && 'type=image,push-by-digest=true,name-canonical=true,push=true' || 'type=image' }}
       -
         name: Export digest
         run: |
@@ -204,7 +237,7 @@ jobs:
     needs:
       - changes
       - multi
-    if: (github.event_name == 'push' || github.event_name == 'schedule') && needs.changes.outputs.has_images == 'true' && needs.multi.result == 'success'
+    if: (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && needs.changes.outputs.has_images == 'true' && needs.multi.result == 'success'
     steps:
       -
         name: Determine docker tag
