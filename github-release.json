@@ -100,5 +100,10 @@
     },
     "musescore/MuseScore",
     "microsoft/PowerToys",
-    "denoland/deno"
+    "denoland/deno",
+    {
+        "repo": "Vanilla-OS/live-iso",
+        "versions": 1,
+        "flat": true
+    }
 ]
