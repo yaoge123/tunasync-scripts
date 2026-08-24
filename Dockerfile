@@ -7,7 +7,7 @@ RUN apt-get update && \
         rm -rf /var/lib/apt/lists/*
 
 # Flutter needs the unpublished apitools version; see gsutil issue #1819.
-RUN python3 -m venv /opt/venv && \
+RUN python3 -m venv --system-site-packages /opt/venv && \
     /opt/venv/bin/python -m pip install --no-cache-dir \
     gsutil https://github.com/google/apitools/archive/refs/tags/v0.5.35.zip
 
@@ -30,6 +30,11 @@ COPY --from=python-builder /opt/venv /opt/venv
 RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && locale-gen
 ENV LANG=en_US.UTF-8 LANGUAGE=en_US.UTF-8 LC_ALL=en_US.UTF-8 HOME=/tmp \
     PATH=/opt/venv/bin:${PATH}
+
+# Keep Debian-provided Python modules visible from the venv used by the image.
+RUN python3 -c 'import click, OpenSSL, requests, socks, tqdm, yaml; from pyquery import PyQuery as pq' && \
+    gsutil version -l >/dev/null
+
 RUN mkdir -p /home/tunasync-scripts
 CMD ["/bin/bash"]
 

@@ -9,9 +9,79 @@ on:
     branches:
     - master
     - docker-test
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+      has_images: ${{ steps.filter.outputs.has_images }}
+    steps:
+      -
+        name: Checkout history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      -
+        name: Select changed images
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          all_images='["ftpsync","nix-channels","rubygems-mirror","rustup-mirror","tsumugu","tunasync-scripts"]'
+          if [ "$EVENT_NAME" = workflow_dispatch ] || [ "$EVENT_NAME" = schedule ]; then
+            images="$all_images"
+          else
+            if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="$(git rev-parse "$HEAD_SHA^1")"
+            fi
+            changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+            selected=''
+            global_changed=false
+            for path in $changed; do
+              case "$path" in
+                .github/workflows/docker-images.yml)
+                  global_changed=true
+                  ;;
+                .dockerignore)
+                  global_changed=true
+                  ;;
+                Dockerfile)
+                  selected="$selected tunasync-scripts"
+                  ;;
+                dockerfiles/ftpsync/*) selected="$selected ftpsync" ;;
+                dockerfiles/nix-channels/*) selected="$selected nix-channels" ;;
+                dockerfiles/rubygems-mirror/*) selected="$selected rubygems-mirror" ;;
+                dockerfiles/rustup-mirror/*) selected="$selected rustup-mirror" ;;
+                dockerfiles/tsumugu/*) selected="$selected tsumugu" ;;
+              esac
+            done
+            if [ "$global_changed" = true ]; then
+              images="$all_images"
+            else
+              # De-duplicate the image names selected by the changed paths.
+              images="$(printf '%s\n' $selected | sort -u | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+            fi
+          fi
+
+          if [ "$images" = '[]' ]; then
+            # Keep the matrix syntactically non-empty; the job-level condition skips it.
+            echo 'images=["__none__"]' >> "$GITHUB_OUTPUT"
+            echo 'has_images=false' >> "$GITHUB_OUTPUT"
+            echo 'No Dockerfile or build workflow changes; image jobs skipped.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "images=$images" >> "$GITHUB_OUTPUT"
+            echo 'has_images=true' >> "$GITHUB_OUTPUT"
+            echo "Selected images: $images" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   crate_versions:
     runs-on: ubuntu-latest
     outputs:
@@ -43,19 +113,13 @@ jobs:
 
   multi:
     needs:
+      - changes
       - crate_versions
+    if: needs.changes.outputs.has_images == 'true'
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - ftpsync
-          - nix-channels
-          - rubygems-mirror
-          - rustup-mirror
-          # - shadowmire
-          - tsumugu
-          - tunasync-scripts
-          # - freighter
+        image: ${{ fromJSON(needs.changes.outputs.images) }}
         os:
           - ubuntu-latest
           - ubuntu-24.04-arm
@@ -99,7 +163,7 @@ jobs:
       -
         name: Login to DockerHub
         uses: docker/login-action@v4
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -112,13 +176,14 @@ jobs:
           file: ${{ steps.docker_file_dir.outputs.docker_file_dir }}/Dockerfile
           build-args: |
             CRATE_VERSION=${{ matrix.image == 'rustup-mirror' && needs.crate_versions.outputs.rustup_mirror || matrix.image == 'tsumugu' && needs.crate_versions.outputs.tsumugu || '' }}
-          push: ${{ github.event_name == 'push' }}
+          push: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
           tags: tunathu/${{ matrix.image }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ runner.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ runner.arch }}
-          outputs: ${{ github.event_name == 'push' && 'type=image,push-by-digest=true,name-canonical=true,push=true' || 'type=image' }}
+          pull: true
+          outputs: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'type=image,push-by-digest=true,name-canonical=true,push=true' || 'type=image' }}
       -
         name: Export digest
         run: |
@@ -137,8 +202,9 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs:
+      - changes
       - multi
-    if: github.event_name == 'push' && needs.multi.result == 'success'
+    if: (github.event_name == 'push' || github.event_name == 'schedule') && needs.changes.outputs.has_images == 'true' && needs.multi.result == 'success'
     steps:
       -
         name: Determine docker tag
@@ -172,6 +238,7 @@ jobs:
         name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
+          set -euo pipefail
           created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           source_url="${{ github.server_url }}/${{ github.repository }}"
           version="${{ steps.docker_tag.outputs.docker_tag }}"
@@ -182,7 +249,17 @@ jobs:
               sources+=("tunathu/$i@sha256:$digest")
             done < <(find "$i" -maxdepth 1 -type f -printf '%f\n' | sort)
 
-            docker buildx imagetools create -t "tunathu/$i:${{ steps.docker_tag.outputs.docker_tag }}" \
+            target="tunathu/$i:${{ steps.docker_tag.outputs.docker_tag }}"
+            current_json="$(docker buildx imagetools inspect "$target" --raw 2>/dev/null || true)"
+            new_json="$(find "$i" -maxdepth 1 -type f -printf '%f\n' | jq -Rsc 'split("\\n") | map(select(length > 0) | "sha256:" + .) | sort')"
+            old_json="$(jq -c '[.manifests[]? | select(.platform.os != "unknown") | .digest] | sort' <<< "$current_json" 2>/dev/null || echo '[]')"
+            current_revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$current_json" 2>/dev/null || true)"
+            if [ "$old_json" != '[]' ] && [ "$old_json" = "$new_json" ] && [ "$current_revision" = "${{ github.sha }}" ]; then
+              echo "$target already references the same platform manifests; skipping manifest push."
+              continue
+            fi
+
+            docker buildx imagetools create -t "$target" \
               --annotation "index:org.opencontainers.image.created=$created" \
               --annotation "index:org.opencontainers.image.description=Runtime image for the $i mirror job" \
               --annotation "index:org.opencontainers.image.revision=${{ github.sha }}" \
