@@ -253,8 +253,7 @@ jobs:
             current_json="$(docker buildx imagetools inspect "$target" --raw 2>/dev/null || true)"
             new_json="$(find "$i" -maxdepth 1 -type f -printf '%f\n' | jq -Rsc 'split("\\n") | map(select(length > 0) | "sha256:" + .) | sort')"
             old_json="$(jq -c '[.manifests[]? | select(.platform.os != "unknown") | .digest] | sort' <<< "$current_json" 2>/dev/null || echo '[]')"
-            current_revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$current_json" 2>/dev/null || true)"
-            if [ "$old_json" != '[]' ] && [ "$old_json" = "$new_json" ] && [ "$current_revision" = "${{ github.sha }}" ]; then
+            if [ "$old_json" != '[]' ] && [ "$old_json" = "$new_json" ]; then
               echo "$target already references the same platform manifests; skipping manifest push."
               continue
             fi
