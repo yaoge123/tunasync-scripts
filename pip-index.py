@@ -9,7 +9,9 @@ mirror. Used by the pytorch and jetson-pypi tunasync jobs; the same
 script is mounted into tunathu/tunasync-scripts:latest via docker_volumes.
 
 Additions on top of the upstream script:
-  - Multi-host href rewrite (download.pytorch.org + download-r2.pytorch.org).
+  - Rewrite-all href policy: every absolute href is rewritten to URLBASE
+    regardless of host (multi-host upstreams like download-r2.pytorch.org,
+    pypi.nvidia.com, repo.amd.com need no configuration).
   - EXTRA_REWRITES so hrefs to other hosts (e.g. files.pythonhosted.org)
     can be redirected to a sibling local mirror prefix (e.g. /pypi/web).
   - DEVPI_MODE: query devpi channel JSON API to crawl only that channel's
@@ -32,14 +34,17 @@ Environment variables:
   URLBASE                    Local URL prefix used when rewriting hrefs.
                              Defaults to "/<TUNASYNC_MIRROR_NAME>/".
                              Always normalised to leading + trailing "/".
-  REWRITE_HOSTS              Comma-separated upstream hosts whose absolute
-                             hrefs should be rewritten to URLBASE. Hrefs
-                             starting with "/" are always rewritten too.
-                             Defaults to the host of TUNASYNC_UPSTREAM_URL.
+                             Every absolute http(s) href is rewritten to
+                             this prefix by default (the crawler downloads
+                             every linked file regardless of host, so the
+                             rewrite covers every host too).
   EXTRA_REWRITES             Comma-separated "host=prefix" rules for hrefs
                              of OTHER hosts, e.g.
                              "files.pythonhosted.org=/pypi/web".
-                             Default empty.
+                             Files on these hosts are NOT downloaded; they are
+                             expected to be served by the sibling local mirror
+                             at <prefix> (equivalent to ustclug PR #174's
+                             PYPI_URLBASE). Default empty.
   USE_PYTORCH_RELEASES       PyTorch-only. "1" -> additionally consume
                              pytorch.github.io releases.json (or
                              published_versions.json with GET_ALL=1) to
@@ -83,6 +88,7 @@ RELEASES_URL = "https://raw.githubusercontent.com/pytorch/pytorch.github.io/refs
 PUBLISHED_VERSION_URL = "https://raw.githubusercontent.com/pytorch/pytorch.github.io/refs/heads/site/published_versions.json"
 A_RE = re.compile(r"<a ([^>]*)>")
 HREF_RE = re.compile(r'href="([^"]+)"')
+ABS_HREF_RE = re.compile(r'href="((?:https?:)?//[^"]+)"')
 
 
 base = Path(os.environ.get("TO", os.environ.get("TUNASYNC_WORKING_DIR", ".")))
@@ -110,17 +116,6 @@ custom_endpoints = [
     e.strip() for e in os.environ.get("CUSTOM_ENDPOINTS", "").split(",") if e.strip()
 ]
 
-# REWRITE_HOSTS defaults to the host of TUNASYNC_UPSTREAM_URL when unset.
-upstream_url = os.environ.get("TUNASYNC_UPSTREAM_URL", "")
-if upstream_url:
-    default_hosts = urlparse(upstream_url).netloc
-else:
-    default_hosts = "download.pytorch.org,download-r2.pytorch.org"
-rewrite_hosts = [
-    h.strip()
-    for h in os.environ.get("REWRITE_HOSTS", default_hosts).split(",")
-    if h.strip()
-]
 # EXTRA_REWRITES: host=prefix rules to rewrite hrefs of OTHER hosts to
 # different mirror prefixes. See docstring for usage and Issue #86 context.
 extra_rewrites: list[tuple[str, str]] = []
@@ -141,7 +136,7 @@ for rule in os.environ.get("EXTRA_REWRITES", "").split(","):
         prefix += "/"
     if not prefix.startswith("/"):
         prefix = "/" + prefix
-    extra_rewrites.append((host, prefix))
+    extra_rewrites.append((host.lower(), prefix))
 # exclude nightly builds, by default
 no_nightly = os.environ.get("NO_NIGHTLY", "1") == "1"
 
@@ -302,27 +297,41 @@ async def get_devpi_projects(
 
 
 def rewrite_index(index_resp: str) -> str:
-    """Rewrite href attributes so the saved index page points at this mirror."""
-    # Relative-from-root form: href="/whl/..." -> href="<URLBASE>whl/..."
-    index_resp = index_resp.replace('href="/', f'href="{urlbase}')
-    # Absolute upstream URLs from any rewrite host.
-    for host in rewrite_hosts:
-        index_resp = index_resp.replace(
-            f'href="https://{host}/', f'href="{urlbase}'
-        )
-        index_resp = index_resp.replace(
-            f'href="http://{host}/', f'href="{urlbase}'
-        )
-    # Absolute URLs from OTHER hosts that have an explicit local prefix
-    # (e.g. files.pythonhosted.org -> /pypi/web/). See Issue #86.
-    for host, prefix in extra_rewrites:
-        index_resp = index_resp.replace(
-            f'href="https://{host}/', f'href="{prefix}'
-        )
-        index_resp = index_resp.replace(
-            f'href="http://{host}/', f'href="{prefix}'
-        )
-    return index_resp
+    """Rewrite href attributes so the saved index page points at this mirror.
+
+    EVERY absolute http(s) href is rewritten to URLBASE by default: the
+    crawler downloads every linked file regardless of host, so the rewrite
+    must cover every host too — otherwise pip silently bypasses the mirror
+    whenever the upstream starts linking from a new host (seen with
+    files.pythonhosted.org in Issue #86, pypi.nvidia.com, repo.amd.com).
+    Hosts listed in EXTRA_REWRITES are the exception: their hrefs map to
+    their own local prefix and the files are served by that sibling mirror.
+    """
+
+    def replace_abs(m: "re.Match[str]") -> str:
+        url = m.group(1)
+        parsed = urlparse(url if not url.startswith("//") else f"https:{url}")
+        host = parsed.netloc.lower()
+        prefix = urlbase
+        for h, p in extra_rewrites:
+            if host == h:
+                prefix = p
+                break
+        # Rebuild the URL on the local prefix, keeping query and fragment
+        # (pip relies on the "#sha256=..." fragment for hash checking).
+        local = f"{prefix}{parsed.path.lstrip('/')}"
+        if parsed.query:
+            local += f"?{parsed.query}"
+        if parsed.fragment:
+            local += f"#{parsed.fragment}"
+        return f'href="{local}"'
+
+    # Root-relative first: href="/whl/..." -> href="<URLBASE>whl/...".
+    # The (?!/) lookahead keeps protocol-relative href="//host/..." intact
+    # for the absolute pass below; that pass emits href="<URLBASE>..." which
+    # must NOT be rewritten again, so it runs after this one.
+    index_resp = re.sub(r'href="/(?!/)', f'href="{urlbase}', index_resp)
+    return ABS_HREF_RE.sub(replace_abs, index_resp)
 
 
 async def recursive_download(client: aiohttp.ClientSession, url: str):
@@ -388,6 +397,14 @@ async def recursive_download(client: aiohttp.ClientSession, url: str):
             with overwrite(index_dir / filename, "w") as f:
                 f.write(index_resp)
     else:
+        # Files on EXTRA_REWRITES hosts are served by a sibling local mirror
+        # (e.g. files.pythonhosted.org -> /pypi/web), so only rewrite hrefs
+        # and never download them here. Equivalent to ustclug PR #174's
+        # PYPI_URLBASE behaviour.
+        url_host = urlparse(url).netloc.lower()
+        if any(url_host == host for host, _ in extra_rewrites):
+            logging.info(f"Skipping download of {url} (EXTRA_REWRITES host)")
+            return
         dest = safe_local_path(base, raw_path)
         if dest.exists():
             return
