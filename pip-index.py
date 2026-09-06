@@ -17,6 +17,8 @@ Additions on top of the upstream script:
   - DEVPI_MODE: query devpi channel JSON API to crawl only that channel's
     own projects via .../<channel>/+simple/<project>/ instead of walking
     the full inherited PyPI namespace.
+  - CLEANUP: optionally delete stale local files no crawled URL maps to
+    (safety-capped by CLEANUP_MAX_DELETE).
   - Switched httpx -> aiohttp so it runs inside the shared
     tunathu/tunasync-scripts:latest image with no extra dependencies.
 
@@ -65,6 +67,14 @@ Environment variables:
   TIMEOUT                    Per-request total timeout (seconds).
                              Default "120".
   DRY_RUN                    "1" -> log only, do not write anything.
+  CLEANUP                    "1" -> after crawling, delete local files that
+                             no crawled URL maps to (stale/yanked content,
+                             leftover .tmp). Subtrees skipped due to 403 and
+                             (with NO_NIGHTLY=1) nightly paths are never
+                             deleted. Default "0".
+  CLEANUP_MAX_DELETE         Safety cap: CLEANUP refuses to delete anything
+                             when stale candidates exceed this count.
+                             Default "1000".
   https_proxy / HTTPS_PROXY  Honoured automatically (aiohttp trust_env).
 """
 
@@ -95,6 +105,8 @@ base = Path(os.environ.get("TO", os.environ.get("TUNASYNC_WORKING_DIR", ".")))
 dry_run = os.environ.get("DRY_RUN", "0") == "1"
 jobs = int(os.environ.get("JOBS", "1"))
 timeout_sec = int(os.environ.get("TIMEOUT", "120"))
+cleanup = os.environ.get("CLEANUP", "0") == "1"
+cleanup_max_delete = int(os.environ.get("CLEANUP_MAX_DELETE", "1000"))
 
 # URLBASE defaults to /<TUNASYNC_MIRROR_NAME>/ when unset.
 mirror_name = os.environ.get("TUNASYNC_MIRROR_NAME", "")
@@ -144,6 +156,10 @@ sem = asyncio.Semaphore(jobs)
 # Track URLs we have already started processing so links from cross-referenced
 # index pages do not cause duplicate work or infinite recursion.
 visited: set[str] = set()
+# Local directories whose index pages were skipped due to upstream 403.
+# Their contents are unreachable this run but still exist upstream, so
+# CLEANUP must not treat them as stale.
+forbidden_dirs: set[Path] = set()
 
 
 def safe_local_path(base_dir: Path, raw_path: str) -> Path:
@@ -347,7 +363,21 @@ async def recursive_download(client: aiohttp.ClientSession, url: str):
         # index.html (current) or torch_stable.html (old)
         async with sem:
             logging.info(f"Getting {url}")
-            contents = await get_with_progress(client, url)
+            try:
+                contents = await get_with_progress(client, url)
+            except aiohttp.ClientResponseError as e:
+                # Some index pages are blocked by upstream too, e.g.
+                # https://download.pytorch.org/whl/rocm7.14/cuda-bindings/
+                # Skip the whole subtree, same as blocked files below.
+                if e.status == 403:
+                    logging.warning(f"Forbidden: {url}, skipping.")
+                    if url.endswith("/"):
+                        forbidden_dirs.add(safe_local_path(base, raw_path))
+                    else:
+                        parent = raw_path.rsplit("/", 1)[0] if "/" in raw_path else ""
+                        forbidden_dirs.add(safe_local_path(base, parent))
+                    return
+                raise
             index_resp = contents.decode("utf-8")
             if url.endswith("/"):
                 filename = "index.html"
@@ -454,6 +484,75 @@ async def expand_devpi_endpoint(
     return expanded
 
 
+def cleanup_stale_files() -> None:
+    """Delete local files that no crawled URL maps to (CLEANUP=1).
+
+    `visited` holds every URL this run started processing; each maps to a
+    local file by the same rules recursive_download uses. Anything else
+    under `base` is stale (removed/yanked upstream, leftover .tmp, ...).
+    Refuses to delete more than CLEANUP_MAX_DELETE files in one run so a
+    partial crawl cannot wipe the tree. Subtrees whose index page was
+    skipped due to 403, and (with NO_NIGHTLY=1) nightly paths, are never
+    candidates: unreachable this run does not mean gone upstream.
+    """
+    expected: set[Path] = set()
+    for url in visited:
+        raw_path = unquote(urlparse(url).path)
+        try:
+            if url.endswith("/"):
+                expected.add(safe_local_path(base, raw_path) / "index.html")
+            else:
+                expected.add(safe_local_path(base, raw_path))
+        except ValueError:
+            continue
+
+    root = base.resolve()
+    candidates: list[Path] = []
+    excluded_forbidden = 0
+    excluded_nightly = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p in expected:
+                continue
+            if no_nightly and "/nightly/" in str(p):
+                excluded_nightly += 1
+                continue
+            if any(p.is_relative_to(d) for d in forbidden_dirs):
+                excluded_forbidden += 1
+                continue
+            candidates.append(p)
+    logging.info(
+        f"CLEANUP: {len(candidates)} stale candidates "
+        f"(excluded {excluded_forbidden} under 403 subtrees, "
+        f"{excluded_nightly} nightly)"
+    )
+    if len(candidates) > cleanup_max_delete:
+        logging.error(
+            f"CLEANUP: {len(candidates)} candidates exceed "
+            f"CLEANUP_MAX_DELETE={cleanup_max_delete}, refusing to delete"
+        )
+        return
+    for p in candidates[:20]:
+        logging.info(f"CLEANUP: stale file {p}")
+    if len(candidates) > 20:
+        logging.info(f"CLEANUP: ... and {len(candidates) - 20} more")
+    if dry_run:
+        return
+    for p in candidates:
+        p.unlink()
+    # Prune directories left empty, bottom-up.
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        d = Path(dirpath)
+        if d == root:
+            continue
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    logging.info(f"CLEANUP: deleted {len(candidates)} stale files")
+
+
 async def main():
     timeout_obj = aiohttp.ClientTimeout(total=timeout_sec)
     connector = aiohttp.TCPConnector(limit=jobs)
@@ -532,6 +631,9 @@ async def main():
             return
 
         await asyncio.gather(*(recursive_download(client, url) for url in urls))
+
+    if cleanup:
+        cleanup_stale_files()
 
 
 if __name__ == "__main__":
