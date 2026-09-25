@@ -63,12 +63,17 @@ class PackageNotFoundError(Exception):
     pass
 
 
-class ExitProgramException(Exception):
-    pass
+# Raising an exception from the SIGTERM handler is unreliable: the main
+# thread is usually blocked waiting on futures, so the handler may fire
+# late or not at all (in production a SIGTERM'd run kept downloading until
+# SIGKILL, while another ignored TERM for hours). Set a flag instead and
+# let the worker loops exit at the next completed future.
+stop_requested = False
 
 
 def exit_handler(signum: int, frame: Optional[FrameType]) -> None:
-    raise ExitProgramException
+    global stop_requested
+    stop_requested = True
 
 
 signal.signal(signal.SIGTERM, exit_handler)
@@ -738,6 +743,12 @@ class SyncBase:
                 for future in tqdm(
                     as_completed(futures), total=len(package_names), desc="Updating"
                 ):
+                    if stop_requested:
+                        logger.info(
+                            "Termination requested; saving state and cancelling pending downloads"
+                        )
+                        self.local_db.dump_json()
+                        exit_with_futures(futures)
                     idx, package_name = futures[future]
                     try:
                         serial = future.result()
@@ -753,7 +764,7 @@ class SyncBase:
                     if idx % 100 == 0:
                         logger.info("dumping local db...")
                         self.local_db.dump_json()
-            except (ExitProgramException, KeyboardInterrupt):
+            except KeyboardInterrupt:
                 exit_with_futures(futures)
         return success
 
@@ -1402,6 +1413,8 @@ def genlocal(ctx: click.Context) -> None:
                 total=len(dir_items),
                 desc="Reading packages from json/",
             ):
+                if stop_requested:
+                    exit_with_futures(futures)
                 package_name = futures[future].name
                 try:
                     serial = future.result()
@@ -1413,7 +1426,7 @@ def genlocal(ctx: click.Context) -> None:
                     logger.warning(
                         "%s generated an exception", package_name, exc_info=True
                     )
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
     logger.info(
         "%d out of %d packages have valid serial number", len(local), len(dir_items)
@@ -1515,6 +1528,8 @@ def verify(
         }
         try:
             for future in as_completed(futures):
+                if stop_requested:
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     for p in future.result():
@@ -1524,7 +1539,7 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
     logger.info(
@@ -1572,6 +1587,8 @@ def verify(
                 total=len(simple_dirs),
                 desc="Iterating simple/ directory",
             ):
+                if stop_requested:
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     nps = future.result()
@@ -1582,7 +1599,7 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
         # Part 2: handling packages
