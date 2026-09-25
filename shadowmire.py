@@ -83,7 +83,13 @@ def exit_with_futures(futures: dict[Future[Any], Any]) -> NoReturn:
     logger.info("Exiting...")
     for future in futures:
         future.cancel()
-    sys.exit(1)
+    # Downloads are atomic (tmp file + rename) and callers dump local_db state
+    # before getting here, so there is nothing worth waiting for: both the
+    # ThreadPoolExecutor context manager and the interpreter shutdown would
+    # block on non-daemon worker threads until in-flight downloads finish or
+    # time out. Exit immediately instead of risking a SIGKILL later.
+    logging.shutdown()
+    os._exit(1)
 
 
 class LocalVersionKV:
@@ -700,6 +706,8 @@ class SyncBase:
                     total=len(package_names),
                     desc="Checking consistency",
                 ):
+                    if stop_requested:
+                        exit_with_futures(futures)
                     package_name = futures[future]
                     try:
                         consistent = future.result()
@@ -778,7 +786,20 @@ class SyncBase:
         to_update = plan.update
 
         for package_name in to_remove:
+            if stop_requested:
+                logger.info(
+                    "Termination requested during removals; saving state and exiting"
+                )
+                self.local_db.dump_json()
+                sys.exit(1)
             self.do_remove(package_name)
+
+        if stop_requested:
+            # Also covers the empty `to_update` case, where parallel_update()
+            # would never enter its loop and the flag would go unnoticed.
+            logger.info("Termination requested; saving state and exiting")
+            self.local_db.dump_json()
+            sys.exit(1)
 
         return self.parallel_update(
             to_update, prerelease_excludes, excluded_wheel_filenames
@@ -1384,6 +1405,8 @@ def sync(
     with overwrite(basedir / "plan.json") as f:
         json.dump(plan, f, default=vars, indent=2)
     success = syncer.do_sync_plan(plan, prerelease_excludes, excluded_wheel_filenames)
+    if stop_requested:
+        sys.exit(1)
     syncer.finalize(plan.remote_last_serial)
 
     logger.info("Synchronization finished. Success: %s", success)
@@ -1480,6 +1503,9 @@ def verify(
         len(local_names),
     )
     for package_name in not_in_local:
+        if stop_requested:
+            logger.info("Termination requested; exiting")
+            sys.exit(1)
         logger.info("package %s not in local db", package_name)
         if remove_not_in_local:
             # Old bandersnatch would download packages without normalization,
@@ -1497,6 +1523,9 @@ def verify(
         len(plan.remove),
     )
     for package_name in plan.remove:
+        if stop_requested:
+            logger.info("Termination requested; exiting")
+            sys.exit(1)
         # We only take the plan.remove part here
         logger.info("package %s not in remote index", package_name)
         syncer.do_remove(package_name, remove_packages=False)
@@ -1604,6 +1633,9 @@ def verify(
 
         # Part 2: handling packages
         for path in tqdm(packages_pathcache, desc="Iterating path cache"):
+            if stop_requested:
+                logger.info("Termination requested; exiting")
+                sys.exit(1)
             if path not in ref_set:
                 logger.info("removing unreferenced file %s", path)
                 Path(path).unlink(missing_ok=True)
